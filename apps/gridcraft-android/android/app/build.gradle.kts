@@ -278,7 +278,9 @@ abstract class DocumentFontsTask : DefaultTask() {
 
 android {
     namespace = "io.github.artcraftandroid.gridcraft"
-    compileSdk = 37
+    // Local build only: the public SDK repository has no android-37 platform yet, so this
+    // machine builds against 36 (targetSdk stays 36; the code uses no API 37 symbols).
+    compileSdk = 36
     ndkVersion = "29.0.14206865"
 
     defaultConfig {

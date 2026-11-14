@@ -141,6 +141,31 @@ impl DocState {
             content_kind: None,
         }
     }
+
+    /// A workbook loaded from a file: trust its cached values instead of recalculating
+    /// every formula (see `Calc::open`). Used by `file.open`; workbooks built in-memory
+    /// (blank, samples, duplicates) keep `new`, where a full recalculation is wanted.
+    pub fn new_opened(mut wb: Workbook, path: Option<String>, title: String) -> DocState {
+        let mut calc = Calc::new();
+        calc.open(&mut wb);
+        let wb = Arc::new(wb);
+        let sel = Selection::at(wb.active().map(|s| s.view_active).unwrap_or_default());
+        DocState {
+            saved: wb.clone(),
+            wb,
+            calc,
+            selection: sel,
+            undo: vec![],
+            redo: vec![],
+            path,
+            revision: 1,
+            uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            title,
+            sheet_selections: vec![],
+            unlocked_ranges: vec![],
+            content_kind: None,
+        }
+    }
     pub fn is_dirty(&self) -> bool {
         !Arc::ptr_eq(&self.wb, &self.saved)
     }

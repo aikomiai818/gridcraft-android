@@ -408,6 +408,10 @@ struct PassHost<'a> {
     tainted: HashSet<Key>,
     /// Whether the formula being evaluated has read a previous value.
     taint: bool,
+    /// Per-round COUNTIF frequency cache (one map per range read): built from the range's
+    /// values, which can't change mid-round. Fresh for every `PassHost`, so never stale
+    /// across rounds.
+    count_cache: gridcraft_functions::CountCache,
 }
 
 impl<'a> PassHost<'a> {
@@ -431,6 +435,7 @@ impl<'a> PassHost<'a> {
             members: HashSet::default(),
             tainted: HashSet::default(),
             taint: false,
+            count_cache: gridcraft_functions::CountCache::default(),
         }
     }
 }
@@ -628,6 +633,32 @@ impl Host for PassHost<'_> {
     fn workbook(&self) -> &Workbook {
         self.wb
     }
+    fn has_spill_on(&self, sheet: usize) -> bool {
+        self.spills.keys().any(|k| k.0 == sheet)
+    }
+    fn count_cache(&mut self) -> Option<&mut gridcraft_functions::CountCache> {
+        Some(&mut self.count_cache)
+    }
+    fn count_range(
+        &mut self,
+        sheet: usize,
+        range: RangeRef,
+        criterion: &gridcraft_functions::Criterion,
+    ) -> Option<f64> {
+        // Same guards as the cache itself: values must not change mid-round.
+        if self.wb.calc.iterative || self.has_spill_on(sheet) {
+            return None;
+        }
+        let key = (sheet, range);
+        // A map already built for this range answers without reading the range at all.
+        if let Some(n) = self.count_cache.get(key, criterion) {
+            return Some(n);
+        }
+        // First COUNTIF over this range this round: read the values once (one O(n) pass)
+        // and build the map; every later COUNTIF over the same range is an O(1) lookup.
+        let values = self.range_values(sheet, range);
+        self.count_cache.count_values(key, &values, criterion)
+    }
     fn spill_range(&mut self, sheet: usize, anchor: CellRef) -> Option<RangeRef> {
         let k = (sheet, anchor);
         if !(self.pending.contains(&k) || self.results.contains_key(&k)) {
@@ -781,6 +812,81 @@ impl Host for PassHost<'_> {
     }
 }
 
+/// The anchors of every dynamic-array spill referenced anywhere in the workbook, directly
+/// (`B1#`) or through a defined name (`Seq` → `Sheet1!$B$1#`). A spill anchor must be
+/// evaluated on open even when it has a cached value: the stored `spill_ranges` is empty
+/// after a reload (the file's spill values come back as plain cells), so a formula that
+/// reads the spill — directly, or through a name — gets `#REF!` until the anchor is
+/// recalculated. Names are followed (a name may point at another name); a visited set
+/// stops cycles.
+fn spill_anchors(wb: &Workbook) -> HashSet<Key> {
+    use gridcraft_formula::{SheetSel, UnOp};
+    use std::sync::Arc;
+    let mut anchors: HashSet<Key> = HashSet::default();
+    let mut work: Vec<(Arc<Expr>, usize)> = Vec::new();
+    let mut seen_names: HashSet<(String, usize)> = HashSet::default();
+    // Seed with every formula in the workbook, and every defined name's refersTo (a spill
+    // may only be referenced from a name).
+    for (si, sheet) in wb.sheets.iter().enumerate() {
+        for cell in sheet.cells.iter().map(|(_, c)| c) {
+            if let Some(e) = cell.formula.as_ref().and_then(|f| f.expr_arc()) {
+                work.push((e, si));
+            }
+        }
+    }
+    for n in &wb.names {
+        let scope = n.scope.unwrap_or(0);
+        if seen_names.insert((n.name.clone(), scope))
+            && let Ok(e) = gridcraft_formula::parse(&n.formula)
+        {
+            work.push((Arc::new(e), scope));
+        }
+    }
+    while let Some((e, si)) = work.pop() {
+        let resolve = |r: &gridcraft_formula::Reference| -> Option<Key> {
+            let sheet = match &r.sheet {
+                SheetSel::Current => Some(si),
+                SheetSel::Named(name) => wb.sheet_index(name),
+                SheetSel::Span(a, _) => wb.sheet_index(a),
+            };
+            sheet.map(|s| (s, r.range().start))
+        };
+        e.walk(&mut |x| match x {
+            Expr::Unary(UnOp::Spill, inner) => {
+                if let Expr::Ref(r) = &**inner
+                    && let Some(k) = resolve(r)
+                {
+                    anchors.insert(k);
+                }
+            }
+            Expr::Call(n, args) if n.eq_ignore_ascii_case("ANCHORARRAY") => {
+                if let Some(Expr::Ref(r)) = args.first()
+                    && let Some(k) = resolve(r)
+                {
+                    anchors.insert(k);
+                }
+            }
+            Expr::Name(n) => {
+                let (scope_sheet, bare) = match n.split_once('!') {
+                    Some((s, b)) => match wb.sheet_index(s.trim_matches('\'')) {
+                        Some(i) => (i, b),
+                        None => return,
+                    },
+                    None => (si, n.as_str()),
+                };
+                if let Some(def) = wb.name(bare, scope_sheet)
+                    && seen_names.insert((def.name.clone(), def.scope.unwrap_or(0)))
+                    && let Ok(e2) = gridcraft_formula::parse(&def.formula)
+                {
+                    work.push((Arc::new(e2), def.scope.unwrap_or(si)));
+                }
+            }
+            _ => {}
+        });
+    }
+    anchors
+}
+
 impl Calc {
     pub fn new() -> Self {
         Self::default()
@@ -809,7 +915,7 @@ impl Calc {
         self.graph.settle();
     }
 
-    /// Recalculates every formula (F9 / Ctrl+Alt+F9, and after loading).
+    /// Recalculates every formula (F9 / Ctrl+Alt+F9).
     pub fn recalc_all(&mut self, wb: &mut Workbook) {
         self.rebuild(wb);
         // Spills are laid out again from the formulas where they are now (a structural edit moves
@@ -824,6 +930,51 @@ impl Calc {
         }
         let all: Vec<Key> = self.graph.nodes.keys().copied().collect();
         self.run(wb, all, true);
+    }
+
+    /// Prepares a workbook loaded from a file: builds the dependency graph so later edits
+    /// recalculate correctly, but does NOT evaluate every formula. The file's cached values
+    /// are trusted, the way Excel loads a workbook whose `calcPr` doesn't ask for a full
+    /// recalculation on load. Only formulas with no cached value, and volatile/dynamic ones
+    /// (`NOW`, `TODAY`, `RAND`, `INDIRECT`, `OFFSET`, ...), are evaluated now; everything
+    /// else is recalculated on demand by edits, or all at once with F9 (`formulas.calculateNow`).
+    ///
+    /// Two exceptions must still be evaluated now, even with a cached value, because their
+    /// values live in cells other than their own and those cells are empty until the formula
+    /// runs: legacy array formulas (`f.array` is set — the non-anchor cells read their values
+    /// from the spill the evaluation lays out) and formulas whose cached value is an array
+    /// wider or taller than one cell (a dynamic array such as `SEQUENCE`, whose spill other
+    /// formulas may reference directly or through a defined name). Skipping them leaves
+    /// `#REF!`/empty cells where the spill should be. A third case is covered the same
+    /// way: any spill anchor referenced anywhere in the workbook (directly, or through a
+    /// name) is evaluated now, because the stored `spill_ranges` is empty after a reload
+    /// and the referencing formula would otherwise read `#REF!`.
+    pub fn open(&mut self, wb: &mut Workbook) {
+        self.rebuild(wb);
+        let mut dirty: Vec<Key> = Vec::new();
+        for (si, sheet) in wb.sheets.iter().enumerate() {
+            for (c, cell) in sheet.cells.iter() {
+                let Some(f) = &cell.formula else { continue };
+                let lays_out_spill = f.array.is_some()
+                    || matches!(&cell.value, Value::Array(a) if a.rows > 1 || a.cols > 1);
+                if cell.value == Value::Empty
+                    || lays_out_spill
+                    || self.graph.nodes.get(&(si, c)).is_some_and(|n| n.dynamic)
+                {
+                    dirty.push((si, c));
+                }
+            }
+        }
+        for k in spill_anchors(wb) {
+            if wb.sheet(k.0).and_then(|s| s.cell(k.1)).is_some_and(|c| c.formula.is_some())
+                && !dirty.contains(&k)
+            {
+                dirty.push(k);
+            }
+        }
+        if !dirty.is_empty() {
+            self.run(wb, dirty, false);
+        }
     }
 
     /// Updates the graph for cells whose content changed and recalculates what depends on them.
@@ -1320,6 +1471,54 @@ pub(crate) mod tests {
         deps.clear();
         calc.graph.dependents(1, CellRef::parse("A2").unwrap(), &mut deps);
         assert_eq!(deps, vec![at("DA9"), at("DA9")]);
+    }
+
+    /// COUNTIF over one range, answered from the per-round frequency cache without
+    /// materializing the range: a thousand COUNTIFs over a thousand-row range must give
+    /// the same values as a plain scan (the cache is only a shortcut, never the semantics).
+    #[test]
+    fn countif_direct_matches_scan() {
+        let mut wb = Workbook::new();
+        if let Some(sh) = wb.sheet_mut(0) {
+            // Column A: 1000 values, a number every third row, text otherwise.
+            for r in 0..1000u32 {
+                let v = if r % 3 == 0 {
+                    Value::Number(f64::from(r % 7))
+                } else {
+                    Value::from(format!("v{}", r % 10))
+                };
+                sh.cells.set(CellRef::new(r, 0), Cell::value(v));
+            }
+            // Column B: 1000 COUNTIFs over A, criteria cycling through the same values.
+            for r in 0..1000u32 {
+                let crit = if r % 3 == 0 { format!("{}", r % 7) } else { format!("v{}", r % 10) };
+                sh.cells.set(
+                    CellRef::new(r, 1),
+                    Cell::formula(Formula::new(&format!("=COUNTIF($A$1:$A$1000,\"{crit}\")"))),
+                );
+            }
+        }
+        let mut calc = Calc::new();
+        calc.recalc_all(&mut wb);
+        let sh = wb.sheet(0).unwrap();
+        for r in 0..1000u32 {
+            let want = if r % 3 == 0 {
+                // Number criterion: numbers equal to r%7 (text never parses to a number here).
+                (0..1000u32).filter(|x| x % 3 == 0 && x % 7 == r % 7).count()
+            } else {
+                (0..1000u32).filter(|x| x % 3 != 0 && x % 10 == r % 10).count()
+            } as f64;
+            let got = sh.value(CellRef::new(r, 1));
+            assert_eq!(got, Value::Number(want), "row {r}");
+        }
+        // Editing one counted value updates only its COUNTIFs, through the same path.
+        let edited = CellRef::new(3, 0);
+        wb.sheet_mut(0).unwrap().cells.set(edited, Cell::value(Value::from("v3")));
+        calc.cells_changed(&mut wb, &[(0, edited)]);
+        let sh = wb.sheet(0).unwrap();
+        // Row 3 held Number(3): the COUNTIFs for "3" lose one, the ones for "v3" gain one.
+        assert_eq!(sh.value(CellRef::new(3, 1)), Value::Number(47.0));
+        assert_eq!(sh.value(CellRef::new(13, 1)), Value::Number(67.0));
     }
 
     /// For tests of `PassHost::visit_range`, which can't be reached from outside this module: the

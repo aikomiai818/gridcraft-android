@@ -309,9 +309,6 @@ pub fn compare(a: &Value, b: &Value) -> Ordering {
 /// Compares numbers the way Excel does: both are rounded to 15 significant digits first, so binary
 /// noise such as `0.1+0.2` versus `0.3` counts as equal.
 pub fn compare_numbers(a: f64, b: f64) -> Ordering {
-    fn round15(x: f64) -> f64 {
-        if !x.is_finite() || x == 0.0 { x } else { format!("{x:.14e}").parse().unwrap_or(x) }
-    }
     if a == b {
         return Ordering::Equal;
     }
@@ -321,6 +318,22 @@ pub fn compare_numbers(a: f64, b: f64) -> Ordering {
         return a.partial_cmp(&b).unwrap_or(Ordering::Equal);
     }
     round15(a).partial_cmp(&round15(b)).unwrap_or(Ordering::Equal)
+}
+
+fn round15(x: f64) -> f64 {
+    if !x.is_finite() || x == 0.0 { x } else { format!("{x:.14e}").parse().unwrap_or(x) }
+}
+
+/// Canonical key for a number under [`compare_numbers`]: two numbers share a key exactly
+/// when `compare_numbers` calls them equal (15 significant digits). `-0.0` normalizes to
+/// `0.0` (they compare equal), and every NaN normalizes to one key (`compare_numbers`
+/// calls any NaN equal to any number, via its `partial_cmp` fallback).
+pub fn number_key(x: f64) -> u64 {
+    if x.is_nan() {
+        return f64::NAN.to_bits();
+    }
+    let r = if x == 0.0 { 0.0 } else { round15(x) };
+    r.to_bits()
 }
 
 /// Case-insensitive text order (Unicode lowercase).

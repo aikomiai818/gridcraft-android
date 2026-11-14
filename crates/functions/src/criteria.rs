@@ -1,9 +1,11 @@
 //! Excel criteria (COUNTIF, SUMIFS, DCOUNT…) and wildcard matching.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 use gridcraft_core::parse::parse_number_text;
-use gridcraft_core::{CellError, Value, compare_numbers, compare_text};
+use gridcraft_core::{Array, CellError, RangeRef, Value, compare_numbers, compare_text, number_key};
 
 /// Longest text criterion COUNTIF and its relatives accept, in UTF-16 code units as Excel
 /// counts them (😀 is two units); a longer one is `#VALUE!`.
@@ -40,8 +42,11 @@ enum Operand {
 }
 
 /// A parsed criterion.
+///
+/// Public (fields private) so the calculation host can pass one through to
+/// [`CountCache`]: it only forwards the value, the matching stays here.
 #[derive(Clone, Debug)]
-pub(crate) struct Criterion {
+pub struct Criterion {
     op: Op,
     operand: Operand,
     /// The criterion was a bare `""` (or empty cell text): matches blanks and empty strings.
@@ -50,7 +55,7 @@ pub(crate) struct Criterion {
 
 impl Criterion {
     /// Parses a criterion value the way COUNTIF does.
-    pub(crate) fn parse(v: &Value) -> Criterion {
+    pub fn parse(v: &Value) -> Criterion {
         match v {
             Value::Number(n) => Criterion { op: Op::Eq, operand: Operand::Number(*n), bare_empty: false },
             Value::Bool(b) => Criterion { op: Op::Eq, operand: Operand::Bool(*b), bare_empty: false },
@@ -65,7 +70,7 @@ impl Criterion {
     /// functions: like `parse`, but text longer than 255 UTF-16 code units is `#VALUE!`, as in
     /// Excel (checked on Excel 2016 and Microsoft 365: `"a"×254 & "😀"` is 255 characters but
     /// 256 units, and is `#VALUE!`).
-    pub(crate) fn parse_arg(v: &Value) -> Result<Criterion, CellError> {
+    pub fn parse_arg(v: &Value) -> Result<Criterion, CellError> {
         match v {
             Value::Array(a) => Criterion::parse_arg(a.data.first().unwrap_or(&Value::Empty)),
             // A UTF-8 string has at least as many bytes as UTF-16 units, so short text skips the count.
@@ -188,6 +193,169 @@ impl Criterion {
                 Op::Gt | Op::Ge => matches!(&v, Value::Text(t) if compare_text(t, kept) == Ordering::Greater),
             },
         }
+    }
+}
+
+/// Frequency map of one range's values, for answering COUNTIF without scanning the range
+/// on every call. Built once from the range's materialized values, it answers an
+/// exact-equality criterion (`=` / `<>`, no wildcards) by lookup; anything else (an
+/// ordering operator, a wildcard pattern, a comparison on a cut text) returns `None` so
+/// the caller falls back to scanning, exactly as [`Criterion::matches`] would.
+///
+/// The map mirrors `matches` field for field: numbers keyed by [`number_key`] (15-digit
+/// rounding, so `0.1+0.2` and `0.3` share a key), text cells keyed by their lower-cased
+/// form (wildcard matching is case-insensitive), text that parses as a number counted
+/// under its numeric value too (a Number criterion counts text `"5"`), NaN cells counted
+/// apart (`compare_numbers` calls any NaN equal to any number), and blanks kept separate
+/// (a Number criterion never counts them).
+struct FreqMap {
+    total: usize,
+    numbers: HashMap<u64, usize>,
+    num_text: HashMap<u64, usize>,
+    texts: HashMap<String, usize>,
+    bools: [usize; 2],
+    errors: HashMap<u32, usize>,
+    nan: usize,
+    empty: usize,
+}
+
+impl FreqMap {
+    /// Builds the map from a slice of values. `None` when a value can't be keyed (a nested
+    /// array), so the caller falls back to scanning.
+    fn build_values(values: &[Value]) -> Option<FreqMap> {
+        let mut m = FreqMap {
+            total: values.len(),
+            numbers: HashMap::default(),
+            num_text: HashMap::default(),
+            texts: HashMap::default(),
+            bools: [0, 0],
+            errors: HashMap::default(),
+            nan: 0,
+            empty: 0,
+        };
+        for v in values {
+            // `matches` reads an array value's first element; do the same, one level.
+            let v = match v {
+                Value::Array(a) => match a.data.first() {
+                    Some(Value::Array(_)) | None => return None,
+                    Some(first) => first,
+                },
+                other => other,
+            };
+            match v {
+                Value::Number(n) => {
+                    if n.is_nan() {
+                        m.nan += 1;
+                    } else {
+                        *m.numbers.entry(number_key(*n)).or_insert(0) += 1;
+                    }
+                }
+                Value::Text(t) => {
+                    let key: String = lower_chars(t).into_iter().collect();
+                    *m.texts.entry(key).or_insert(0) += 1;
+                    if let Some(n) = parse_number_text(t) {
+                        if n.is_nan() {
+                            m.nan += 1;
+                        } else {
+                            *m.num_text.entry(number_key(n)).or_insert(0) += 1;
+                        }
+                    }
+                }
+                Value::Bool(b) => m.bools[*b as usize] += 1,
+                Value::Error(e) => *m.errors.entry(e.code()).or_insert(0) += 1,
+                Value::Empty => m.empty += 1,
+                Value::Array(_) => return None,
+            }
+        }
+        Some(m)
+    }
+
+    /// Exact-equality count for `criterion` (`None`: the criterion needs a scan).
+    fn count(&self, c: &Criterion) -> Option<usize> {
+        // A bare `""` matches blanks and empty strings, whatever the operator.
+        if c.bare_empty {
+            return Some(self.empty + self.texts.get("").copied().unwrap_or(0));
+        }
+        match c.op {
+            Op::Eq | Op::Ne => {}
+            _ => return None,
+        }
+        let eq = match &c.operand {
+            Operand::Blank => self.empty,
+            Operand::Number(n) => {
+                if n.is_nan() {
+                    self.numbers.values().sum::<usize>() + self.num_text.values().sum::<usize>() + self.nan
+                } else {
+                    let k = number_key(*n);
+                    self.numbers.get(&k).copied().unwrap_or(0)
+                        + self.num_text.get(&k).copied().unwrap_or(0)
+                        + self.nan
+                }
+            }
+            Operand::Bool(b) => self.bools[*b as usize],
+            Operand::Error(e) => self.errors.get(&e.code()).copied().unwrap_or(0),
+            Operand::Text(pat) => {
+                if has_wildcards(pat) {
+                    return None;
+                }
+                let key: String = lower_chars(pat).into_iter().collect();
+                self.texts.get(&key).copied().unwrap_or(0)
+            }
+            Operand::CutText(_) => 0,
+        };
+        Some(match c.op {
+            Op::Eq => eq,
+            Op::Ne => self.total - eq,
+            _ => return None,
+        })
+    }
+}
+
+/// Per-pass cache of range frequency maps, so COUNTIF over the same large range answers
+/// from one O(n) build instead of one O(n) scan per call (a workbook with a hundred
+/// thousand COUNTIFs over a hundred-thousand-row range otherwise does ~10^10 comparisons
+/// on every recalculation). Lives on the evaluation host, one per recalculation round: a
+/// range's values can't change mid-round, so a map built from the range's current values
+/// stays right for the rest of the round. The host must not hand it a range whose values
+/// can still change (a spill laid out later in the round, or an iterative recalculation).
+#[derive(Default)]
+pub struct CountCache {
+    maps: HashMap<(usize, RangeRef), Rc<FreqMap>>,
+}
+
+impl CountCache {
+    /// Count of cells in `range` (identified by `source`, the sheet + range it was read
+    /// from) matching `criterion`. `None` when the criterion needs a scan.
+    pub fn count(&mut self, source: (usize, RangeRef), range: &Array, criterion: &Criterion) -> Option<f64> {
+        self.count_values(source, &range.data, criterion)
+    }
+
+    /// Count of the values in `values` (identified by `source`) matching `criterion`: the
+    /// map is built from `values` on first use and reused afterwards, so callers that
+    /// already hold the values pay one O(n) build per range instead of one per call.
+    /// `None` when the criterion needs a scan (or the values can't be keyed).
+    pub fn count_values(
+        &mut self,
+        source: (usize, RangeRef),
+        values: &[Value],
+        criterion: &Criterion,
+    ) -> Option<f64> {
+        let map = match self.maps.get(&source) {
+            Some(m) => m.clone(),
+            None => {
+                let m = Rc::new(FreqMap::build_values(values)?);
+                self.maps.insert(source, m.clone());
+                m
+            }
+        };
+        map.count(criterion).map(|n| n as f64)
+    }
+
+    /// Count from an already-built map only (`None` when no map exists for `source` or
+    /// the criterion needs a scan): lets a caller skip reading the range entirely when
+    /// the map is already there.
+    pub fn get(&self, source: (usize, RangeRef), criterion: &Criterion) -> Option<f64> {
+        self.maps.get(&source)?.count(criterion).map(|n| n as f64)
     }
 }
 
@@ -396,5 +564,54 @@ mod tests {
         assert!(wildcard_match("i*", "\u{130}stanbul"));
         assert!(has_wildcards("a*"));
         assert!(!has_wildcards("abc"));
+    }
+
+    /// The frequency cache must agree with a plain scan for every criterion it answers,
+    /// and decline (fall back to the scan) for operators and wildcard patterns.
+    #[test]
+    fn count_cache_matches_scan() {
+        use gridcraft_core::{Array, CellRef, RangeRef};
+        let values = vec![
+            Value::Number(5.0),
+            Value::Number(0.1 + 0.2),
+            Value::Number(0.3),
+            Value::from("5"),
+            Value::from("Apple"),
+            Value::from("apple"),
+            Value::from(""),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Empty,
+            Value::Error(CellError::NA),
+            Value::Number(0.0),
+            Value::Number(-0.0),
+            Value::from("5.0"),
+        ];
+        let range = Array::new(values.len(), 1, values.clone()).unwrap();
+        let source = (0, RangeRef::new(CellRef::new(0, 0), CellRef::new(values.len() as u32 - 1, 0)));
+        // Criteria the cache must answer, with the scan as the oracle.
+        for c in ["5", "0.3", "apple", "APPLE", "TRUE", "FALSE", "#N/A", "", "=", "<>", "<>5", "<>apple", "0"] {
+            let crit = Criterion::parse_arg(&Value::from(c)).unwrap();
+            let scan = range.iter().filter(|v| crit.matches(v)).count() as f64;
+            let mut cache = CountCache::default();
+            let got = cache.count(source, &range, &crit);
+            assert_eq!(got, Some(scan), "criterion {c:?}: cache {got:?} vs scan {scan}");
+        }
+        // Operators and wildcard patterns need a scan.
+        for c in [">5", ">=5", "<5", "a*", "?pple", "<>a*"] {
+            let crit = Criterion::parse_arg(&Value::from(c)).unwrap();
+            let mut cache = CountCache::default();
+            assert_eq!(cache.count(source, &range, &crit), None, "criterion {c:?} should need a scan");
+        }
+        // Two ranges under different keys keep separate maps.
+        let other = Array::new(3, 1, vec![Value::from("apple"), Value::from("apple"), Value::Number(1.0)]).unwrap();
+        let other_source = (0, RangeRef::new(CellRef::new(0, 1), CellRef::new(2, 1)));
+        let crit = Criterion::parse_arg(&Value::from("apple")).unwrap();
+        let mut cache = CountCache::default();
+        assert_eq!(cache.count(source, &range, &crit), Some(2.0));
+        assert_eq!(cache.count(other_source, &other, &crit), Some(2.0));
+        let crit5 = Criterion::parse_arg(&Value::from("5")).unwrap();
+        assert_eq!(cache.count(source, &range, &crit5), Some(3.0));
+        assert_eq!(cache.count(other_source, &other, &crit5), Some(0.0));
     }
 }

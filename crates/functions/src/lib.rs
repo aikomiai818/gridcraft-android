@@ -15,7 +15,9 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use gridcraft_core::{Array, CellError, DateSystem, Value};
+use gridcraft_core::{Array, CellError, DateSystem, RangeRef, Value};
+
+pub use criteria::{CountCache, Criterion};
 
 /// Builds a [`FnSpec`] whose implementation returns `Result<Value, CellError>`.
 ///
@@ -85,16 +87,21 @@ pub use stat::{aggregate_values, aggregate_values_k};
 pub struct Arg {
     pub value: Value,
     pub from_ref: bool,
+    /// The sheet + range this argument was read from, when it came from a single range
+    /// reference (`None` for literals, unions, and anything the evaluator didn't read from
+    /// one range). Lets COUNTIF answer from a per-round frequency cache instead of
+    /// scanning the range on every call.
+    pub source: Option<(usize, RangeRef)>,
 }
 
 impl Arg {
     /// A literal (non-reference) argument.
     pub fn val(value: impl Into<Value>) -> Arg {
-        Arg { value: value.into(), from_ref: false }
+        Arg { value: value.into(), from_ref: false, source: None }
     }
     /// An argument that came from a cell or range reference.
     pub fn reference(value: impl Into<Value>) -> Arg {
-        Arg { value: value.into(), from_ref: true }
+        Arg { value: value.into(), from_ref: true, source: None }
     }
 }
 
@@ -109,6 +116,17 @@ pub trait Ctx {
     /// for `record` (a row of `db` below its labels). `None` when that cell holds no formula or the
     /// criteria didn't come from a reference.
     fn computed_criterion(&mut self, _row: usize, _col: usize, _db: &Array, _record: usize) -> Option<bool> {
+        None
+    }
+    /// Counts cells of `range` (read from `source`, a sheet + range) matching a COUNTIF
+    /// criterion, using a per-round frequency cache when the host keeps one. `None` means
+    /// "no cache: scan instead". The default is `None`; the calculation host overrides it.
+    fn count_matching(
+        &mut self,
+        _source: (usize, RangeRef),
+        _range: &Array,
+        _criterion: &Criterion,
+    ) -> Option<f64> {
         None
     }
 }

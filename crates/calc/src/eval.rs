@@ -76,6 +76,27 @@ pub trait Host {
     fn visit_range(&mut self, _sheet: usize, _range: RangeRef, _f: &mut dyn FnMut(&Value) -> bool) -> bool {
         false
     }
+    /// Whether a dynamic-array spill was laid out on `sheet` during this pass. COUNTIF's
+    /// frequency cache is only valid while no spill exists on the sheet: a spill laid out
+    /// after the map was built would change the range's values.
+    fn has_spill_on(&self, _sheet: usize) -> bool {
+        false
+    }
+    /// The per-pass COUNTIF frequency cache, if this host keeps one.
+    fn count_cache(&mut self) -> Option<&mut gridcraft_functions::CountCache> {
+        None
+    }
+    /// COUNTIF over one range, answered from the host's per-round frequency cache without
+    /// materializing the range (the generic path would build the whole range as an array
+    /// for every call). `None` means "no cache: use the generic path".
+    fn count_range(
+        &mut self,
+        _sheet: usize,
+        _range: RangeRef,
+        _criterion: &gridcraft_functions::Criterion,
+    ) -> Option<f64> {
+        None
+    }
 }
 
 pub struct Evaluator<'h> {
@@ -123,6 +144,25 @@ impl Ctx for FnCtx<'_, '_> {
             .collect();
         let mut ev = Evaluator { host: &mut *self.ev.host, sheet: area.sheet, at, env, depth: self.ev.depth };
         Some(matches!(ev.value(&shifted).scalar().to_bool(), Ok(true)))
+    }
+    /// COUNTIF over one range: answer from the host's per-round frequency cache. The cache
+    /// is only sound while the range's values can't change mid-round, so it stays off for
+    /// iterative calculation (values change across passes) and for sheets with a spill laid
+    /// out during this pass (a spill laid out after the map was built would change the range).
+    fn count_matching(
+        &mut self,
+        source: (usize, RangeRef),
+        range: &Array,
+        criterion: &gridcraft_functions::Criterion,
+    ) -> Option<f64> {
+        let host = &mut *self.ev.host;
+        if host.workbook().calc.iterative {
+            return None;
+        }
+        if host.has_spill_on(source.0) {
+            return None;
+        }
+        host.count_cache()?.count(source, range, criterion)
     }
 }
 
@@ -613,10 +653,10 @@ impl<'h> Evaluator<'h> {
                     // An array of indexes picks element by element: `CHOOSE({1,2},A1:A3,B1:B3)`
                     // is a two-column array. The library CHOOSE lifts over its arguments.
                     let Some(spec) = gridcraft_functions::lookup(name) else { return err(CellError::Name) };
-                    let mut evaluated = vec![Arg { value: index, from_ref: false }];
+                    let mut evaluated = vec![Arg { value: index, from_ref: false, source: None }];
                     for a in &args[1..] {
                         let value = self.value(a);
-                        evaluated.push(Arg { value, from_ref: false });
+                        evaluated.push(Arg { value, from_ref: false, source: None });
                     }
                     let mut ctx = FnCtx { ev: self, criteria: None };
                     return gridcraft_functions::call(spec, &evaluated, &mut ctx).pipe(Ev::V);
@@ -812,6 +852,13 @@ impl<'h> Evaluator<'h> {
         if let Some(kind) = Agg::of(spec.name) {
             return self.aggregate(kind, args);
         }
+        if spec.name == "COUNTIF" && args.len() == 2 {
+            // Answered from the host's frequency cache without materializing the range;
+            // falls through to the generic path when the direct path doesn't apply.
+            if let Some(n) = self.countif_direct(args) {
+                return Ev::V(Value::Number(n));
+            }
+        }
         let mut evaluated = Vec::with_capacity(args.len());
         // SUMIF/AVERAGEIF: the size of the criteria range (argument 1), which the sum range takes.
         let mut criteria_shape = None;
@@ -837,6 +884,11 @@ impl<'h> Evaluator<'h> {
                 }
             }
             let from_ref = matches!(ev, Ev::R(_));
+            // A single range reference: COUNTIF can answer from the host's frequency cache.
+            let source = match &ev {
+                Ev::R(areas) if areas.len() == 1 => Some((areas[0].sheet, areas[0].range)),
+                _ => None,
+            };
             let value = match ev {
                 Ev::R(areas) if areas.len() > 1 => {
                     // Multi-area references (unions): flatten into one row for aggregates.
@@ -851,10 +903,23 @@ impl<'h> Evaluator<'h> {
                 }
                 ev => self.deref(ev),
             };
-            evaluated.push(Arg { value, from_ref });
+            evaluated.push(Arg { value, from_ref, source });
         }
         let mut ctx = FnCtx { ev: self, criteria };
         gridcraft_functions::call(spec, &evaluated, &mut ctx).pipe(Ev::V)
+    }
+
+    /// COUNTIF over a single range reference, answered from the host's per-round frequency
+    /// cache without materializing the range: the generic path would build a 133k-element
+    /// array for every one of a hundred thousand COUNTIF calls. `None` falls back to the
+    /// generic path (a range that isn't one reference, or a criterion that needs a scan).
+    fn countif_direct(&mut self, args: &[Expr]) -> Option<f64> {
+        let ev0 = self.eval(&args[0]);
+        let Ev::R(areas) = ev0 else { return None };
+        let [area] = areas.as_slice() else { return None };
+        let crit_val = self.value(&args[1]);
+        let crit = gridcraft_functions::Criterion::parse_arg(&crit_val.scalar()).ok()?;
+        self.host.count_range(area.sheet, area.range, &crit)
     }
 
     /// Performs aggregation operations without copying its ranges: blocks are folded over the stored
@@ -905,7 +970,7 @@ impl<'h> Evaluator<'h> {
         let (Some(sum), Some(count)) = (gridcraft_functions::lookup("SUM"), gridcraft_functions::lookup("COUNT")) else {
             return Err(err(CellError::Name));
         };
-        let args = [Arg { value, from_ref }];
+        let args = [Arg { value, from_ref, source: None }];
         if kind != Agg::Count {
             match gridcraft_functions::call(sum, &args, &mut FnCtx { ev: self, criteria: None }) {
                 Value::Number(n) => acc.sum += n,
@@ -1299,7 +1364,7 @@ impl<'h> Evaluator<'h> {
             let horizontal = l.range.height() == 1 && l.range.width() > 1;
             let same_len = if vertical { r.range.height() == l.range.height() } else { r.range.width() == l.range.width() };
             if !matches!(key, Value::Array(_)) && (vertical || horizontal) && same_len {
-                let mut xargs = vec![Arg { value: key, from_ref: false }, Arg { value: self.area_value(&l), from_ref: true }];
+                let mut xargs = vec![Arg { value: key, from_ref: false, source: None }, Arg { value: self.area_value(&l), from_ref: true, source: None }];
                 // An empty match_mode before a given search_mode is the default (0), not the end.
                 let given = |i: usize| args.get(i).is_some_and(|e| !matches!(e, Expr::Missing));
                 let last = if given(5) {
@@ -1311,10 +1376,10 @@ impl<'h> Evaluator<'h> {
                 };
                 for i in 4..=last {
                     match args.get(i) {
-                        Some(Expr::Missing) | None => xargs.push(Arg { value: Value::Number(0.0), from_ref: false }),
+                        Some(Expr::Missing) | None => xargs.push(Arg { value: Value::Number(0.0), from_ref: false, source: None }),
                         Some(e) => {
                             let value = self.value(e);
-                            xargs.push(Arg { value, from_ref: false });
+                            xargs.push(Arg { value, from_ref: false, source: None });
                         }
                     }
                 }

@@ -1029,10 +1029,18 @@ fn minifs(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     num_val(v.iter().copied().reduce(f64::min).unwrap_or(0.0))
 }
 
-fn countif(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
-    let range = as_array(&crate::util::arg(a, 0)?.value);
-    let c = Criterion::parse_arg(&crate::util::arg(a, 1)?.value.scalar())?;
-    num_val(range.iter().filter(|v| c.matches(v)).count() as f64)
+fn countif(a: &[Arg], c: &mut dyn Ctx) -> R<Value> {
+    let range_arg = crate::util::arg(a, 0)?;
+    let range = as_array(&range_arg.value);
+    let crit = Criterion::parse_arg(&crate::util::arg(a, 1)?.value.scalar())?;
+    // A range read from one sheet range answers from the host's per-round frequency cache
+    // when it keeps one (one O(n) build instead of one O(n) scan per call); otherwise scan.
+    if let Some(source) = range_arg.source
+        && let Some(n) = c.count_matching(source, &range, &crit)
+    {
+        return num_val(n);
+    }
+    num_val(range.iter().filter(|v| crit.matches(v)).count() as f64)
 }
 
 /// SUMIF / AVERAGEIF: matched numbers from the sum range, read at the criteria range's positions.
